@@ -61,6 +61,7 @@ jobs:
       - name: Start relay
         run: |
           uv run --frozen uvicorn main:app --port 8000 > relay.log 2>&1 &
+          echo "RELAY_PID=$!" >> "$GITHUB_ENV"
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:8000/ready && exit 0
             sleep 1
@@ -73,9 +74,13 @@ jobs:
           RELAY_BASE_URL: http://127.0.0.1:8000
         run: uv run --frozen pytest -q test_integration.py
 
-      - name: Relay log
+      - name: Stop relay
         if: always()
-        run: cat relay.log || true
+        # A running `uv run` holds uv's cache lock, which makes setup-uv's
+        # post-job cache prune wait and then fail.
+        run: |
+          [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null || true
+          cat relay.log || true
 
   deploy:
     needs: test
