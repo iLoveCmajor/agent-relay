@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: agent_relay
+        ports:
+          # Random host port, so a local Postgres on 5432 doesn't clash under act.
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d agent_relay"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Point the app at the postgres service
+        env:
+          MAPPED_PORT: ${{ job.services.postgres.ports['5432'] }}
+        run: |
+          if [ -n "$ACT" ]; then
+            # act runs this job in a container and puts services on a per-job
+            # network; join it so the "postgres" alias resolves.
+            me=$(docker inspect "$(hostname)" --format '{{.Name}}' | tr -d /)
+            net=$(docker network ls --format '{{.Name}}' | grep -x "$me-.*-network")
+            docker network connect "$net" "$(hostname)"
+            addr=postgres:5432
+          else
+            # GitHub's runners reach the service on localhost at the mapped port.
+            addr=localhost:$MAPPED_PORT
+          fi
+          echo "postgres service at $addr"
+          echo "RELAY_DATABASE_URL=postgresql+psycopg://relay:relay@$addr/agent_relay" >> "$GITHUB_ENV"
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 30); do
+            uv run --frozen python -c "import psycopg, os; psycopg.connect(os.environ['RELAY_DATABASE_URL'].replace('+psycopg', '')).close()" && exit 0
+            sleep 2
+          done
+          exit 1
+
+      - name: Starter tests
+        run: uv run --frozen pytest -q test_agent_relay.py
+
+      - name: Start relay
+        run: |
+          uv run --frozen uvicorn main:app --port 8000 > relay.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/ready && exit 0
+            sleep 1
+          done
+          cat relay.log
+          exit 1
+
+      - name: Integration tests
+        env:
+          RELAY_BASE_URL: http://127.0.0.1:8000
+        run: uv run --frozen pytest -q test_integration.py
+
+      - name: Relay log
+        if: always()
+        run: cat relay.log || true
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      CLUSTER: agent-relay
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install kind and kubectl
+        run: |
+          mkdir -p "$HOME/.local/bin" && echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          arch=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+          command -v kind || { curl -fsSLo "$HOME/.local/bin/kind" "https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-$arch" && chmod +x "$HOME/.local/bin/kind"; }
+          command -v kubectl || { curl -fsSLo "$HOME/.local/bin/kubectl" "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/$arch/kubectl" && chmod +x "$HOME/.local/bin/kubectl"; }
+          kind version && kubectl version --client
+
+      - name: Connect to the kind cluster
+        run: |
+          kind get clusters | grep -qx "$CLUSTER" || kind create cluster --config k8s/kind/cluster.yaml
+          mkdir -p "$HOME/.kube"
+          if [ -n "$ACT" ]; then
+            # act: this job is a container next to the kind node, so join the
+            # kind network and use the node's internal API address.
+            docker network connect kind "$(hostname)" 2>/dev/null || true
+            kind get kubeconfig --name "$CLUSTER" --internal > "$HOME/.kube/config"
+            echo "RELAY_BASE_URL=http://$CLUSTER-control-plane:30080" >> "$GITHUB_ENV"
+          else
+            kind get kubeconfig --name "$CLUSTER" > "$HOME/.kube/config"
+            echo "RELAY_BASE_URL=http://127.0.0.1:8080" >> "$GITHUB_ENV"
+          fi
+          kubectl get nodes
+
+      - name: Build image
+        run: |
+          tag="${GITHUB_SHA::12}-$(date +%Y%m%d%H%M%S)"
+          echo "IMAGE=agent-relay:$tag" >> "$GITHUB_ENV"
+          docker build -t "agent-relay:$tag" -t agent-relay:local .
+
+      - name: Load image into kind
+        run: kind load docker-image "$IMAGE" --name "$CLUSTER"
+
+      - name: Deploy
+        run: |
+          for f in k8s/*.yaml; do
+            sed "s#image: agent-relay:local#image: $IMAGE#" "$f"
+            echo ---
+          done | kubectl apply -f -
+          kubectl -n agent-relay rollout status statefulset/postgres --timeout=180s
+          kubectl -n agent-relay rollout status deployment/relay --timeout=180s
+          kubectl -n agent-relay get pods -o wide
+
+      - name: Smoke test the deployment
+        run: |
+          for i in $(seq 1 30); do curl -sf "$RELAY_BASE_URL/ready" && break; sleep 2; done
+          uv sync --frozen
+          uv run --frozen pytest -q test_integration.py
+          # The deployed dashboard must be this commit's version, not an old image.
+          heading=$(grep -o '<h1>[^<]*</h1>' dashboard.html)
+          curl -fsS "$RELAY_BASE_URL/" | grep -F "$heading"
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl -n agent-relay get pods,svc,pvc || true
+          kubectl -n agent-relay describe deployment/relay || true
+          kubectl -n agent-relay logs deployment/relay --all-containers --tail=50 || true
