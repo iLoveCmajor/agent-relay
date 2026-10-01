@@ -5,8 +5,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1 \
-    PATH="/app/.venv/bin:$PATH" \
-    RELAY_DATABASE_URL=sqlite:////data/agent-relay.db
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
@@ -16,10 +15,8 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY *.py dashboard.html ./
 
-RUN useradd --system --uid 1000 relay \
-    && mkdir /data && chown relay /data
+RUN useradd --system --uid 1000 relay
 USER relay
-VOLUME /data
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s \

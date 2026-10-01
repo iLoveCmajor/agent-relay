@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relay}
+      POSTGRES_DB: agent_relay
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Local only, so tests and psql on this machine can reach it.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d agent_relay"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  relay:
+    build: .
+    image: agent-relay:local
+    environment:
+      RELAY_DATABASE_URL: postgresql+psycopg://relay:${POSTGRES_PASSWORD:-relay}@postgres:5432/agent_relay
+      RELAY_LEASE_SECONDS: ${RELAY_LEASE_SECONDS:-60}
+      RELAY_MAX_ATTEMPTS: ${RELAY_MAX_ATTEMPTS:-5}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
